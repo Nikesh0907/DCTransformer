@@ -144,7 +144,7 @@ def load_img3(filepath):
 #     return kornia.filters.filter2d(input, kernel, border_type)
 
 class DatasetFromFolder(data.Dataset):
-    def __init__(self, image_dir1, image_dir2, image_dir3,upscale_factor, patch_size,input_transform=None):
+    def __init__(self, image_dir1, image_dir2, image_dir3, upscale_factor, patch_size, input_transform=None, train_prop: float = 1.0):
         super(DatasetFromFolder, self).__init__()
 
         self.patch_size = patch_size
@@ -155,7 +155,18 @@ class DatasetFromFolder(data.Dataset):
         self.image_filenames2 = sorted(self.image_filenames2)
         self.image_filenames3 = sorted(self.image_filenames3)
 
-        self.lens = 20000
+        # Clamp proportion
+        if train_prop <= 0 or train_prop > 1:
+            raise ValueError(f"train_prop must be in (0,1], got {train_prop}")
+        total_imgs = min(len(self.image_filenames1), len(self.image_filenames2), len(self.image_filenames3))
+        use_imgs = max(1, int(total_imgs * train_prop))
+        self.image_filenames1 = self.image_filenames1[:use_imgs]
+        self.image_filenames2 = self.image_filenames2[:use_imgs]
+        self.image_filenames3 = self.image_filenames3[:use_imgs]
+
+    self.base_count = len(self.image_filenames1)
+    # Keep large virtual length for abundant random patches
+    self.lens = 20000
 
         self.xs = []
         for img in self.image_filenames1:
@@ -173,7 +184,7 @@ class DatasetFromFolder(data.Dataset):
         self.input_transform = input_transform
 
     def __getitem__(self, index):
-        ind = index % 20
+    ind = index % self.base_count
         img = self.xs[ind]
         img2 = self.ys[ind]
         img3 = self.x_blurs[ind]
