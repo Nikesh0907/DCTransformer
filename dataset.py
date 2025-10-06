@@ -164,27 +164,19 @@ class DatasetFromFolder(data.Dataset):
         self.image_filenames2 = self.image_filenames2[:use_imgs]
         self.image_filenames3 = self.image_filenames3[:use_imgs]
 
-    self.base_count = len(self.image_filenames1)
-    # Keep large virtual length for abundant random patches
-    self.lens = 20000
+        self.base_count = len(self.image_filenames1)
+        # Keep large virtual length for abundant random patches
+        self.lens = 20000
 
-        self.xs = []
-        for img in self.image_filenames1:
-            self.xs.append(load_img(img))
-
-        self.ys = []
-        for img in self.image_filenames2:
-            self.ys.append(load_img1(img))
-
-        self.x_blurs = []
-        for img in self.image_filenames3:
-            self.x_blurs.append(load_img2(img))
+        self.xs = [load_img(p) for p in self.image_filenames1]
+        self.ys = [load_img1(p) for p in self.image_filenames2]
+        self.x_blurs = [load_img2(p) for p in self.image_filenames3]
 
         self.upscale_factor = upscale_factor
         self.input_transform = input_transform
 
     def __getitem__(self, index):
-    ind = index % self.base_count
+        ind = index % self.base_count
         img = self.xs[ind]
         img2 = self.ys[ind]
         img3 = self.x_blurs[ind]
