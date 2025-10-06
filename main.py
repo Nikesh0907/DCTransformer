@@ -36,14 +36,16 @@ parser.add_argument('--patch_size', type=int, default=64, help='training patch s
 parser.add_argument('--testBatchSize', type=int, default=1, help='testing batch size')
 parser.add_argument('--ChDim', type=int, default=31, help='output channel number')
 parser.add_argument('--alpha', type=float, default=0.1, help='alpha')
-parser.add_argument('--nEpochs', type=int, default=0, help='number of epochs to train for')
+parser.add_argument('--nEpochs', type=int, default=0, help='(Deprecated) previously used as resume epoch; use --resume_epoch now')
+parser.add_argument('--total_epochs', type=int, default=200, help='Total number of training epochs to run (end epoch).')
+parser.add_argument('--resume_epoch', type=int, default=0, help='Epoch number to resume from (loads checkpoint epoch_<n>.pth). 0 means start fresh.')
 parser.add_argument('--lr', type=float, default=0.0001, help='Learning Rate. Default=0.01')
 parser.add_argument('--threads', type=int, default=4, help='number of threads for data loader to use')
 parser.add_argument('--seed', type=int, default=123, help='random seed to use. Default=123')
 parser.add_argument('--save_folder', default='TrainedNet/', help='Directory to keep training outputs.')
 parser.add_argument('--outputpath', type=str, default='result/', help='Path to output img')
 parser.add_argument('--mode', default=1, type=int, help='Train or Test.')
-parser.add_argument('--local_rank', default=1, type=int, help='None')
+parser.add_argument('--local_rank', default=0, type=int, help='Local rank for distributed training')
 parser.add_argument('--use_distribute', type=int, default=1, help='None')
 parser.add_argument('--data_root', type=str, default='/data/CAVEdata12/', help='Root directory containing train/ and test/ subfolders.')
 opt = parser.parse_args()
@@ -59,9 +61,13 @@ def set_random_seed(seed):
 
 set_random_seed(opt.seed)
 
-use_dist = opt.use_distribute
+use_dist = opt.use_distribute == 1
 if use_dist:
     dist.init_process_group(backend="nccl", init_method='env://')
+else:
+    # Backward compatibility: map deprecated --nEpochs to resume_epoch if provided
+    if opt.resume_epoch == 0 and opt.nEpochs > 0:
+        opt.resume_epoch = opt.nEpochs
 
 print('===> Loading datasets from', opt.data_root)
 train_set = get_patch_training_set(opt.upscale_factor, opt.patch_size, root_dir=opt.data_root)
@@ -80,12 +86,12 @@ print("===> distribute model")
 
 
 if use_dist:
-    local_rank = torch.distributed.get_rank()
+    local_rank = dist.get_rank()
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
 else:
     local_rank = 0
-    device = 'cuda:0'
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 model = DCT(opt.ChDim,opt.upscale_factor).to(device)
 
@@ -97,14 +103,20 @@ scheduler = MultiStepLR(optimizer, milestones=[100, 150, 175, 190, 195], gamma=0
 
 
 
-if opt.nEpochs != 0:
-    dist.barrier()
-    map_location = {'cuda:%d' % 0: 'cuda:%d' % local_rank}
-    load_dict = torch.load(opt.save_folder+"_epoch_{}.pth".format(opt.nEpochs), map_location=map_location)
-    opt.lr = load_dict['lr']
-    epoch = load_dict['epoch']
-    model.load_state_dict(load_dict['param'])
+if opt.resume_epoch > 0:
+    ckpt_path = os.path.join(opt.save_folder.rstrip('/'), f'epoch_{opt.resume_epoch}.pth')
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(f"Resume checkpoint not found: {ckpt_path}")
+    if use_dist:
+        dist.barrier()
+    map_location = {f'cuda:{0}': f'cuda:{local_rank}'} if device.type == 'cuda' else 'cpu'
+    load_dict = torch.load(ckpt_path, map_location=map_location)
     optimizer.load_state_dict(load_dict['adam'])
+    model.load_state_dict(load_dict['param'])
+    # Optionally override LR with saved LR
+    for pg in optimizer.param_groups:
+        pg['lr'] = load_dict.get('lr', pg['lr'])
+    print(f"Resumed from {ckpt_path} (epoch {load_dict.get('epoch')})")
 
 criterion = nn.L1Loss(reduction='none')
 
@@ -125,8 +137,16 @@ def mkdir(path):
     else:
         print("---  There exsits folder "+ path + " !  ---")
         
-mkdir(opt.save_folder)
-mkdir(opt.outputpath)
+def normalize_dir(p):
+    # Ensure trailing slash and create directory
+    if not p.endswith('/'):
+        p = p + '/'
+    mkdir(p)
+    return p
+
+# Normalize output directories (important for Kaggle /kaggle/working storage)
+opt.save_folder = normalize_dir(opt.save_folder)
+opt.outputpath = normalize_dir(opt.outputpath)
 
 def train(epoch, optimizer, scheduler):
     epoch_loss = 0
@@ -190,21 +210,22 @@ def test():
 
 
 def checkpoint(epoch):
-
-    model_out_path = opt.save_folder+"_epoch_{}.pth".format(epoch)
+    # Save inside folder with clean naming
+    model_out_path = os.path.join(opt.save_folder, f'epoch_{epoch}.pth')
     if epoch % 1 == 0 and local_rank == 0:
         save_dict = dict(
-            lr = optimizer.state_dict()['param_groups'][0]['lr'],
-            param = model.state_dict(),
-            adam = optimizer.state_dict(),
-            epoch = epoch
+            lr=optimizer.state_dict()['param_groups'][0]['lr'],
+            param=model.state_dict(),
+            adam=optimizer.state_dict(),
+            epoch=epoch
         )
         torch.save(save_dict, model_out_path)
+        print(f"Checkpoint saved to {model_out_path}")
 
-        print("Checkpoint saved to {}".format(model_out_path))
-
+start_epoch = opt.resume_epoch + 1
+end_epoch = opt.total_epochs
 if opt.mode == 1:
-    for epoch in range(opt.nEpochs + 1, 201):
+    for epoch in range(start_epoch, end_epoch + 1):
         avg_loss = train(epoch, optimizer, scheduler)
         checkpoint(epoch)
         avg_psnr = test()
