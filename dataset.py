@@ -15,29 +15,125 @@ def is_image_file(filename):
     return any(filename.endswith(extension) for extension in [".png", ".jpg", ".jpeg", ".mat"])
 
 
+def _standardize_hwc(arr, preferred_channels=None, channel_range=(1, 256)):
+    """Return array in (H, W, C) layout.
+
+    Heuristics:
+      1. If already (H,W,C) with C within channel_range and H,W >= C -> keep.
+      2. Try all permutations; pick one where last axis fits preferred_channels (if given) else channel_range,
+         and the first two dims are >= last dim.
+      3. Fallback: treat smallest axis as channels, reorder others preserving relative order.
+    """
+    import itertools
+    arr = np.asarray(arr)
+    if arr.ndim != 3:
+        raise ValueError(f"Expected 3D array, got shape {arr.shape}")
+
+    def is_ok(shape):
+        h,w,c = shape
+        return channel_range[0] <= c <= channel_range[1] and h >= c and w >= c
+
+    # Case 1
+    if is_ok(arr.shape) and (preferred_channels is None or arr.shape[2] == preferred_channels):
+        return arr
+
+    # Case 2: search permutations
+    best = None
+    for perm in itertools.permutations(range(3)):
+        cand = arr.transpose(perm)
+        h,w,c = cand.shape
+        if preferred_channels is not None and c != preferred_channels:
+            continue
+        if is_ok((h,w,c)):
+            best = cand
+            break
+    if best is not None:
+        return best
+
+    # Case 3: fallback smallest axis as channels
+    axes = list(range(3))
+    sizes = list(arr.shape)
+    ch_axis = int(np.argmin(sizes))
+    other_axes = [a for a in axes if a != ch_axis]
+    cand = arr.transpose(other_axes[0], other_axes[1], ch_axis)
+    return cand
+
+
 def load_img(filepath):
-    x = sio.loadmat(filepath)
-    x = x['msi']
-    x = torch.tensor(x).float()
-    return x
+    """Load high-resolution hyperspectral cube.
+
+    Accepts several possible keys to make raw dataset ingestion easier.
+    Expected priority: 'msi' (repo convention) then 'hsi' then first 3D array.
+    """
+    xmat = sio.loadmat(filepath)
+    for k in ['msi', 'hsi', 'HSI', 'MSI']:
+        if k in xmat:
+            cube = xmat[k]
+            break
+    else:
+        # fallback: pick first ndarray with 3 dims
+        cube = None
+        for v in xmat.values():
+            if isinstance(v, np.ndarray) and v.ndim == 3:
+                cube = v
+                break
+        if cube is None:
+            raise KeyError(f"No hyperspectral key found in {filepath}")
+    # Standardize to (H,W,C)
+    cube = _standardize_hwc(cube, preferred_channels=None, channel_range=(4,256))
+    cube = torch.tensor(cube).float()
+    return cube
 
 def load_img1(filepath):
-    x = sio.loadmat(filepath)
-    x = x['RGB']
-    x = torch.tensor(x).float()
-    return x
+    """Load RGB guidance image.
+
+    Uses existing RGB if present; otherwise derives from hyperspectral cube via load_img to ensure orientation.
+    """
+    xmat = sio.loadmat(filepath)
+    if 'RGB' in xmat:
+        rgb = xmat['RGB']
+    elif 'rgb' in xmat:
+        rgb = xmat['rgb']
+    else:
+        cube = load_img(filepath)  # torch (H,W,C)
+        c = cube.shape[2]
+        indices = [int(c*0.15), int(c*0.5), int(c*0.85)]
+        rgb = cube[:, :, indices].numpy()
+    rgb = _standardize_hwc(rgb, preferred_channels=3, channel_range=(3,4))
+    rgb = torch.tensor(rgb).float()
+    return rgb
 
 def load_img2(filepath):
-    x = sio.loadmat(filepath)
-    x = x['blur']
-    x = torch.tensor(x).float()
-    return x
+    xmat = sio.loadmat(filepath)
+    if 'blur' in xmat:
+        arr = xmat['blur']
+    else:
+        # fallback to hyperspectral cube if blur not present (will be sub-sampled later)
+        for k in ['msi', 'hsi', 'HSI']:
+            if k in xmat:
+                arr = xmat[k]
+                break
+        else:
+            raise KeyError(f"No 'blur' key in {filepath}")
+    arr = _standardize_hwc(arr, preferred_channels=None, channel_range=(4,256))
+    return torch.tensor(arr).float()
 
 def load_img3(filepath):
-    x = sio.loadmat(filepath)
-    x = x['LR']
-    x = torch.tensor(x).float()
-    return x
+    xmat = sio.loadmat(filepath)
+    if 'LR' in xmat:
+        lr = xmat['LR']
+    else:
+        # If low-res not provided, attempt naive downscale to half (for robustness in quick experiments)
+        for k in ['msi', 'hsi', 'HSI']:
+            if k in xmat:
+                hs = xmat[k]
+                # simple 2x downscale using stride slicing
+                lr = hs[::2, ::2, :]
+                break
+        else:
+            raise KeyError(f"No 'LR' key in {filepath}")
+    lr = _standardize_hwc(lr, preferred_channels=None, channel_range=(4,256))
+    return torch.tensor(lr).float()
 
 
 # def my_gaussian_blur2d(input, kernel_size, sigma, border_type = 'reflect'):
@@ -82,8 +178,11 @@ class DatasetFromFolder(data.Dataset):
         img2 = self.ys[ind]
         img3 = self.x_blurs[ind]
         upscale_factor = self.upscale_factor
-        w = np.random.randint(0, img.shape[0]-self.patch_size)
-        h = np.random.randint(0, img.shape[1]-self.patch_size)
+        H, W = img.shape[0], img.shape[1]
+        if self.patch_size > H or self.patch_size > W:
+            raise ValueError(f"Patch size {self.patch_size} exceeds image dimensions {(H, W)}. Reduce patch_size or provide larger images.")
+        w = np.random.randint(0, H - self.patch_size + 1)
+        h = np.random.randint(0, W - self.patch_size + 1)
         X = img[w:w+self.patch_size, h:h+self.patch_size, :]
         Y = img2[w:w+self.patch_size, h:h+self.patch_size, :]
 
