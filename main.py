@@ -45,6 +45,7 @@ parser.add_argument('--outputpath', type=str, default='result/', help='Path to o
 parser.add_argument('--mode', default=1, type=int, help='Train or Test.')
 parser.add_argument('--local_rank', default=1, type=int, help='None')
 parser.add_argument('--use_distribute', type=int, default=1, help='None')
+parser.add_argument('--data_root', type=str, default='/data/CAVEdata12/', help='Root directory containing train/ and test/ subfolders.')
 opt = parser.parse_args()
 
 print(opt)
@@ -62,11 +63,11 @@ use_dist = opt.use_distribute
 if use_dist:
     dist.init_process_group(backend="nccl", init_method='env://')
 
-print('===> Loading datasets')
-train_set = get_patch_training_set(opt.upscale_factor, opt.patch_size)
+print('===> Loading datasets from', opt.data_root)
+train_set = get_patch_training_set(opt.upscale_factor, opt.patch_size, root_dir=opt.data_root)
 if use_dist:
     sampler = DistributedSampler(train_set)
-test_set = get_test_set()
+test_set = get_test_set(root_dir=opt.data_root)
 
 if use_dist:
     training_data_loader = DataLoader(dataset=train_set, num_workers=opt.threads, batch_size=opt.batchSize, sampler = sampler, pin_memory=True)
