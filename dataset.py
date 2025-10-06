@@ -120,6 +120,11 @@ def load_img2(filepath):
 
 def load_img3(filepath):
     xmat = sio.loadmat(filepath)
+    hr_source = None
+    for k_hr in ['msi', 'hsi', 'HSI']:
+        if k_hr in xmat and isinstance(xmat[k_hr], np.ndarray) and xmat[k_hr].ndim == 3:
+            hr_source = xmat[k_hr]
+            break
     if 'LR' in xmat:
         lr = xmat['LR']
     else:
@@ -127,7 +132,6 @@ def load_img3(filepath):
         for k in ['msi', 'hsi', 'HSI']:
             if k in xmat:
                 hs = xmat[k]
-                # simple 2x downscale using stride slicing
                 lr = hs[::2, ::2, :]
                 break
         else:
@@ -150,6 +154,35 @@ def load_img3(filepath):
             order = [a for a in axes if a != spec_axis] + [spec_axis]
             arr = arr.transpose(order)
     arr = _standardize_hwc(arr, preferred_channels=None, channel_range=(4,256))
+
+    # Auto-reconstruct if spectral channels suspiciously low (e.g., 12) and HR source available with higher channels.
+    try:
+        if hr_source is not None:
+            hr_src = _standardize_hwc(hr_source, preferred_channels=None, channel_range=(4,256))
+            if arr.shape[2] < 20 and hr_src.shape[2] >= 31 and hr_src.shape[2] > arr.shape[2]:
+                # Attempt to infer scale by integer division of spatial dims
+                h_hr, w_hr = hr_src.shape[:2]
+                h_lr, w_lr = arr.shape[:2]
+                # Typical scale candidates
+                candidates = [8, 4, 2]
+                chosen = None
+                for s in candidates:
+                    if h_hr % s == 0 and w_hr % s == 0 and h_hr // s == h_lr and w_hr // s == w_lr:
+                        chosen = s
+                        break
+                if chosen is None:
+                    # fallback: derive by ratio (round)
+                    ratio_h = max(1, int(round(h_hr / max(1, h_lr))))
+                    ratio_w = max(1, int(round(w_hr / max(1, w_lr))))
+                    chosen = max(ratio_h, ratio_w)
+                # Reconstruct LR by strided slicing
+                recon = hr_src[::chosen, ::chosen, :]
+                # Only replace if reconstructed channel count meets expectation (>= 31)
+                if recon.shape[2] == hr_src.shape[2] and recon.shape[2] >= 31:
+                    arr = recon
+    except Exception:
+        # Silent fallback if any reconstruction step fails
+        pass
     return torch.tensor(arr).float()
 
 
