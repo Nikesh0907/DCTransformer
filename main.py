@@ -9,6 +9,7 @@ import os
 import random
 import time
 import socket
+from math import inf
 
 from torch.optim.lr_scheduler import StepLR, MultiStepLR
 from torch.utils.data import DataLoader
@@ -25,6 +26,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.optim import DistributedOptimizer
 from torch.distributed.rpc import RRef
 from torch.utils.data.distributed import DistributedSampler
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
 
 
 
@@ -50,6 +55,8 @@ parser.add_argument('--use_distribute', type=int, default=1, help='None')
 parser.add_argument('--data_root', type=str, default='/data/CAVEdata12/', help='Root directory containing train/ and test/ subfolders.')
 parser.add_argument('--train_prop', type=float, default=1.0, help='Proportion of training images to use (0-1].')
 parser.add_argument('--virtual_length', type=int, default=20000, help='Number of random patch samples per epoch (dataset length).')
+parser.add_argument('--no_progress', action='store_true', help='Disable tqdm progress bars')
+parser.add_argument('--loss_smooth', type=int, default=50, help='Window for smoothed loss display in progress bar')
 opt = parser.parse_args()
 
 print(opt)
@@ -103,6 +110,10 @@ print('# network parameters: {}'.format(sum(param.numel() for param in model.par
 optimizer = optim.Adam(model.parameters(), lr=opt.lr)
 scheduler = MultiStepLR(optimizer, milestones=[100, 150, 175, 190, 195], gamma=0.5)
 
+if local_rank == 0:
+    print(f"[Dataset] Training base images: {getattr(train_set,'base_count', 'NA')}  | Virtual length: {len(train_set)}  | BatchSize: {opt.batchSize}  | Iter/Epoch: {len(training_data_loader)}")
+    print(f"[Dataset] Test images: {len(test_set)}  | Test Iterations: {len(testing_data_loader)}")
+
 
 
 if opt.resume_epoch > 0:
@@ -154,61 +165,90 @@ def train(epoch, optimizer, scheduler):
     epoch_loss = 0
     global current_step
     model.train()
-    for iteration, batch in enumerate(training_data_loader, 1):
-        # with torch.autograd.set_detect_anomaly(True):
-        Y, Z, X = batch[0].cuda(), batch[1].cuda(), batch[2].cuda()
-
-        optimizer.zero_grad()
-        Y = Variable(Y).float()
-        Z = Variable(Z).float()
-        X = Variable(X).float()
-
-        HX = model(Y,Z)
-
+    iterator = training_data_loader
+    use_bar = (not opt.no_progress) and (tqdm is not None) and (local_rank == 0)
+    pbar = tqdm(iterator, total=len(training_data_loader), disable=not use_bar, desc=f"Epoch {epoch} [train]", ncols=120)
+    recent_losses = []
+    for iteration, batch in enumerate(pbar if use_bar else iterator, 1):
+        Y, Z, X = batch[0].to(device), batch[1].to(device), batch[2].to(device)
+        optimizer.zero_grad(set_to_none=True)
+        Y = Variable(Y).float(); Z = Variable(Z).float(); X = Variable(X).float()
+        # Runtime channel/order correction if corrupted (unexpected channel count)
+        if Y.shape[1] != opt.ChDim and Z.shape[1] == opt.ChDim:
+            # swap if order inverted
+            Y, Z = Z, Y
+        if Y.shape[1] != opt.ChDim:
+            raise RuntimeError(f"HSI tensor channel mismatch (expected {opt.ChDim} got {Y.shape[1]}). Check dataset preparation.")
+        if Z.shape[1] != 3:
+            # attempt to collapse or select first 3 channels as proxy RGB
+            if Z.shape[1] > 3:
+                Z = Z[:, :3, :, :]
+            else:
+                raise RuntimeError(f"RGB guidance has {Z.shape[1]} channels; cannot adapt.")
+        HX = model(Y, Z)
         loss = criterion(HX, X).mean()
-
         epoch_loss += loss.item()
         if local_rank == 0:
             tb_logger.add_scalar('total_loss', loss.item(), current_step)
         current_step += 1
-
         loss.backward()
         optimizer.step()
-
-        if iteration % 100 == 0:
-
-            print("===> Epoch[{}]({}/{}): Loss: {:.4f}".format(epoch, iteration, len(training_data_loader), loss.item()))
-    print("===> Epoch {} Complete: Avg. Loss: {:.4f}".format(epoch, epoch_loss / len(training_data_loader)))
-    return epoch_loss / len(training_data_loader)
+        if use_bar:
+            recent_losses.append(loss.item())
+            if len(recent_losses) > opt.loss_smooth:
+                recent_losses.pop(0)
+            smooth = sum(recent_losses)/len(recent_losses)
+            lr_cur = optimizer.param_groups[0]['lr']
+            pbar.set_postfix({
+                'loss': f"{loss.item():.4f}",
+                'smooth': f"{smooth:.4f}",
+                'lr': f"{lr_cur:.2e}"
+            })
+        elif iteration % 100 == 0 and local_rank == 0:
+            print(f"Epoch {epoch} Iter {iteration}/{len(training_data_loader)} | Loss {loss.item():.4f}")
+    avg = epoch_loss / max(1, len(training_data_loader))
+    if local_rank == 0:
+        print(f"===> Epoch {epoch} Complete: Avg. Loss: {avg:.4f}")
+    return avg
 
 def test():
     avg_psnr = 0
     avg_time = 0
     model.eval()
+    iterator = testing_data_loader
+    use_bar = (not opt.no_progress) and (tqdm is not None) and (local_rank == 0)
+    pbar = tqdm(iterator, total=len(testing_data_loader), disable=not use_bar, desc='[eval]', ncols=120)
     with torch.no_grad():
-        for batch in testing_data_loader:
-            Y, Z, X = batch[0].cuda(), batch[1].cuda(), batch[2].cuda()
-            Y = Variable(Y).float()
-            Z = Variable(Z).float()
-            X = Variable(X).float()
+        for batch in (pbar if use_bar else iterator):
+            Y, Z, X = batch[0].to(device), batch[1].to(device), batch[2].to(device)
+            Y = Variable(Y).float(); Z = Variable(Z).float(); X = Variable(X).float()
             start_time = time.time()
-
-            HX = model(Y,Z)
+            if Y.shape[1] != opt.ChDim and Z.shape[1] == opt.ChDim:
+                Y, Z = Z, Y
+            if Y.shape[1] != opt.ChDim:
+                raise RuntimeError(f"[Eval] HSI channel mismatch {Y.shape[1]} vs {opt.ChDim}")
+            if Z.shape[1] != 3:
+                if Z.shape[1] > 3:
+                    Z = Z[:, :3, :, :]
+                else:
+                    raise RuntimeError(f"[Eval] RGB guidance has {Z.shape[1]} channels")
+            HX = model(Y, Z)
             end_time = time.time()
-
-            X = torch.squeeze(X).permute(1, 2, 0).cpu().numpy()
-            HX = torch.squeeze(HX).permute(1, 2, 0).cpu().numpy()
-            psnr = MPSNR(HX,X)
-            im_name = batch[3][0]
-            print(im_name)
-            print(end_time - start_time)
-            avg_time += end_time - start_time
-            (path, filename) = os.path.split(im_name)
-            io.savemat(opt.outputpath + filename, {'HX': HX})
+            X_np = torch.squeeze(X).permute(1, 2, 0).cpu().numpy()
+            HX_np = torch.squeeze(HX).permute(1, 2, 0).cpu().numpy()
+            psnr = MPSNR(HX_np, X_np)
             avg_psnr += psnr
-    print("===> Avg. PSNR: {:.4f} dB".format(avg_psnr / len(testing_data_loader)))
-    print("===> Avg. time: {:.4f} s".format(avg_time / len(testing_data_loader)))
-    return avg_psnr / len(testing_data_loader)
+            avg_time += (end_time - start_time)
+            if local_rank == 0:
+                im_name = batch[3][0]
+                (path, filename) = os.path.split(im_name)
+                io.savemat(os.path.join(opt.outputpath, filename), {'HX': HX_np})
+            if use_bar:
+                pbar.set_postfix({'psnr_avg': f"{(avg_psnr / max(1, pbar.n)):.3f}"})
+    psnr_final = avg_psnr / max(1, len(testing_data_loader))
+    if local_rank == 0:
+        print(f"===> Avg. PSNR: {psnr_final:.4f} dB | Avg. time: {avg_time / max(1,len(testing_data_loader)):.4f} s")
+    return psnr_final
 
 
 def checkpoint(epoch):

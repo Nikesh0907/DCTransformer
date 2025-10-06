@@ -132,8 +132,25 @@ def load_img3(filepath):
                 break
         else:
             raise KeyError(f"No 'LR' key in {filepath}")
-    lr = _standardize_hwc(lr, preferred_channels=None, channel_range=(4,256))
-    return torch.tensor(lr).float()
+    # Robust reordering: prefer an axis of size close to 31 as spectral
+    arr = np.asarray(lr)
+    if arr.ndim != 3:
+        raise ValueError(f"LR array is not 3D in {filepath}, shape={arr.shape}")
+    target = 31
+    axes = list(range(3))
+    sizes = arr.shape
+    # If already channel-last and size plausible, keep
+    if sizes[2] in (target, 28, 29, 30, 32, 24, 12):
+        pass
+    else:
+        # Find axis closest to target (within reasonable bound)
+        diffs = [abs(s - target) for s in sizes]
+        spec_axis = int(np.argmin(diffs))
+        if spec_axis != 2:
+            order = [a for a in axes if a != spec_axis] + [spec_axis]
+            arr = arr.transpose(order)
+    arr = _standardize_hwc(arr, preferred_channels=None, channel_range=(4,256))
+    return torch.tensor(arr).float()
 
 
 # def my_gaussian_blur2d(input, kernel_size, sigma, border_type = 'reflect'):
