@@ -227,43 +227,55 @@ def test():
     iterator = testing_data_loader
     use_bar = (not opt.no_progress) and (tqdm is not None) and (local_rank == 0)
     pbar = tqdm(iterator, total=len(testing_data_loader), disable=not use_bar, desc='[eval]', ncols=120)
+    processed = 0
+    skipped = 0
     with torch.no_grad():
         for batch in (pbar if use_bar else iterator):
             Y, Z, X = batch[0].to(device), batch[1].to(device), batch[2].to(device)
             Y = Variable(Y).float(); Z = Variable(Z).float(); X = Variable(X).float()
             start_time = time.time()
-            if Y.shape[1] != opt.ChDim and Z.shape[1] == opt.ChDim:
-                Y, Z = Z, Y
-            if Y.shape[1] != opt.ChDim:
-                if opt.reconstruct_lr and X.shape[1] == opt.ChDim:
-                    scale = opt.upscale_factor
-                    Y = torch.nn.functional.interpolate(X, scale_factor=1.0/scale, mode='bicubic', align_corners=False)
-                else:
-                    raise RuntimeError(f"[Eval] HSI channel mismatch {Y.shape[1]} vs {opt.ChDim}")
-            if Z.shape[1] != 3:
-                if Z.shape[1] > 3:
-                    Z = Z[:, :3, :, :]
-                else:
-                    if Y.shape[1] >= 3:
-                        Z = Y[:, [0, Y.shape[1]//2, -1], :, :]
+            try:
+                if Y.shape[1] != opt.ChDim and Z.shape[1] == opt.ChDim:
+                    Y, Z = Z, Y
+                if Y.shape[1] != opt.ChDim:
+                    if opt.reconstruct_lr and X.shape[1] == opt.ChDim:
+                        scale = opt.upscale_factor
+                        Y = torch.nn.functional.interpolate(X, scale_factor=1.0/scale, mode='bicubic', align_corners=False)
                     else:
-                        raise RuntimeError(f"[Eval] RGB guidance has {Z.shape[1]} channels")
-            HX = model(Y, Z)
-            end_time = time.time()
-            X_np = torch.squeeze(X).permute(1, 2, 0).cpu().numpy()
-            HX_np = torch.squeeze(HX).permute(1, 2, 0).cpu().numpy()
-            psnr = MPSNR(HX_np, X_np)
-            avg_psnr += psnr
-            avg_time += (end_time - start_time)
-            if local_rank == 0:
-                im_name = batch[3][0]
-                (path, filename) = os.path.split(im_name)
-                io.savemat(os.path.join(opt.outputpath, filename), {'HX': HX_np})
+                        raise ValueError(f"HSI channel mismatch {Y.shape[1]}")
+                if Z.shape[1] != 3:
+                    if Z.shape[1] > 3:
+                        Z = Z[:, :3, :, :]
+                    else:
+                        if Y.shape[1] >= 3:
+                            Z = Y[:, [0, Y.shape[1]//2, -1], :, :]
+                        else:
+                            raise ValueError(f"RGB guidance channels {Z.shape[1]}")
+                HX = model(Y, Z)
+                end_time = time.time()
+                X_np = torch.squeeze(X).permute(1, 2, 0).cpu().numpy()
+                HX_np = torch.squeeze(HX).permute(1, 2, 0).cpu().numpy()
+                psnr = MPSNR(HX_np, X_np)
+                avg_psnr += psnr
+                avg_time += (end_time - start_time)
+                processed += 1
+                if local_rank == 0:
+                    im_name = batch[3][0]
+                    (path, filename) = os.path.split(im_name)
+                    io.savemat(os.path.join(opt.outputpath, filename), {'HX': HX_np})
+            except Exception as e:
+                skipped += 1
+                if local_rank == 0:
+                    if use_bar:
+                        pbar.write(f"[eval] Skipped sample due to: {e}")
+                    else:
+                        print(f"[eval] Skipped sample due to: {e}")
             if use_bar:
-                pbar.set_postfix({'psnr_avg': f"{(avg_psnr / max(1, pbar.n)):.3f}"})
-    psnr_final = avg_psnr / max(1, len(testing_data_loader))
+                denom = max(1, processed)
+                pbar.set_postfix({'psnr_avg': f"{(avg_psnr / denom):.3f}", 'proc': processed, 'skip': skipped})
+    psnr_final = avg_psnr / max(1, processed)
     if local_rank == 0:
-        print(f"===> Avg. PSNR: {psnr_final:.4f} dB | Avg. time: {avg_time / max(1,len(testing_data_loader)):.4f} s")
+        print(f"===> Eval Complete: Avg. PSNR (processed {processed} / total {len(testing_data_loader)}; skipped {skipped}): {psnr_final:.4f} dB | Avg. time: {avg_time / max(1, processed):.4f} s")
     return psnr_final
 
 
