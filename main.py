@@ -49,6 +49,7 @@ parser.add_argument('--local_rank', default=0, type=int, help='Local rank for di
 parser.add_argument('--use_distribute', type=int, default=1, help='None')
 parser.add_argument('--data_root', type=str, default='/data/CAVEdata12/', help='Root directory containing train/ and test/ subfolders.')
 parser.add_argument('--train_prop', type=float, default=1.0, help='Proportion of training images to use (0-1].')
+parser.add_argument('--virtual_length', type=int, default=20000, help='Number of random patch samples per epoch (dataset length).')
 opt = parser.parse_args()
 
 print(opt)
@@ -71,7 +72,7 @@ else:
         opt.resume_epoch = opt.nEpochs
 
 print('===> Loading datasets from', opt.data_root)
-train_set = get_patch_training_set(opt.upscale_factor, opt.patch_size, root_dir=opt.data_root, train_prop=opt.train_prop)
+train_set = get_patch_training_set(opt.upscale_factor, opt.patch_size, root_dir=opt.data_root, train_prop=opt.train_prop, virtual_length=opt.virtual_length)
 if use_dist:
     sampler = DistributedSampler(train_set)
 test_set = get_test_set(root_dir=opt.data_root)

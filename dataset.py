@@ -144,7 +144,7 @@ def load_img3(filepath):
 #     return kornia.filters.filter2d(input, kernel, border_type)
 
 class DatasetFromFolder(data.Dataset):
-    def __init__(self, image_dir1, image_dir2, image_dir3, upscale_factor, patch_size, input_transform=None, train_prop: float = 1.0):
+    def __init__(self, image_dir1, image_dir2, image_dir3, upscale_factor, patch_size, input_transform=None, train_prop: float = 1.0, virtual_length: int = 20000):
         super(DatasetFromFolder, self).__init__()
 
         self.patch_size = patch_size
@@ -165,8 +165,10 @@ class DatasetFromFolder(data.Dataset):
         self.image_filenames3 = self.image_filenames3[:use_imgs]
 
         self.base_count = len(self.image_filenames1)
-        # Keep large virtual length for abundant random patches
-        self.lens = 20000
+        # Virtual number of samples (random patches) per epoch
+        if virtual_length <= 0:
+            raise ValueError("virtual_length must be > 0")
+        self.lens = virtual_length
 
         self.xs = [load_img(p) for p in self.image_filenames1]
         self.ys = [load_img1(p) for p in self.image_filenames2]

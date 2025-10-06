@@ -20,7 +20,7 @@ def input_transform():
 
 
 
-def get_patch_training_set(upscale_factor, patch_size, root_dir=None, train_prop: float = 1.0):
+def get_patch_training_set(upscale_factor, patch_size, root_dir=None, train_prop: float = 1.0, virtual_length: int = 20000):
     if root_dir is None:
         root_dir = "/data/CAVEdata12/"
     # X: HSI, Y: MSI, X_blur: blurred HSI
@@ -28,7 +28,7 @@ def get_patch_training_set(upscale_factor, patch_size, root_dir=None, train_prop
     train_dir2 = join(root_dir, "train/Y")
     train_dir3 = join(root_dir, "train/X_blur")
 
-    return DatasetFromFolder(train_dir1,train_dir2,train_dir3,upscale_factor, patch_size, input_transform=input_transform(), train_prop=train_prop)
+    return DatasetFromFolder(train_dir1,train_dir2,train_dir3,upscale_factor, patch_size, input_transform=input_transform(), train_prop=train_prop, virtual_length=virtual_length)
 
 
 def get_test_set(root_dir=None):
