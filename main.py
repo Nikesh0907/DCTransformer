@@ -57,6 +57,8 @@ parser.add_argument('--train_prop', type=float, default=1.0, help='Proportion of
 parser.add_argument('--virtual_length', type=int, default=20000, help='Number of random patch samples per epoch (dataset length).')
 parser.add_argument('--no_progress', action='store_true', help='Disable tqdm progress bars')
 parser.add_argument('--loss_smooth', type=int, default=50, help='Window for smoothed loss display in progress bar')
+parser.add_argument('--eval_interval', type=int, default=1, help='Run evaluation every N epochs (set >1 to reduce frequency).')
+parser.add_argument('--reconstruct_lr', action='store_true', help='Reconstruct low-res HSI on-the-fly from HR if channel mismatch occurs.')
 opt = parser.parse_args()
 
 print(opt)
@@ -175,16 +177,23 @@ def train(epoch, optimizer, scheduler):
         Y = Variable(Y).float(); Z = Variable(Z).float(); X = Variable(X).float()
         # Runtime channel/order correction if corrupted (unexpected channel count)
         if Y.shape[1] != opt.ChDim and Z.shape[1] == opt.ChDim:
-            # swap if order inverted
             Y, Z = Z, Y
         if Y.shape[1] != opt.ChDim:
-            raise RuntimeError(f"HSI tensor channel mismatch (expected {opt.ChDim} got {Y.shape[1]}). Check dataset preparation.")
+            if opt.reconstruct_lr and X.shape[1] == opt.ChDim:
+                # Rebuild low-res from HR target
+                scale = opt.upscale_factor
+                Y = torch.nn.functional.interpolate(X, scale_factor=1.0/scale, mode='bicubic', align_corners=False)
+            else:
+                raise RuntimeError(f"HSI tensor channel mismatch (expected {opt.ChDim} got {Y.shape[1]}). Use --reconstruct_lr or fix dataset.")
         if Z.shape[1] != 3:
-            # attempt to collapse or select first 3 channels as proxy RGB
             if Z.shape[1] > 3:
                 Z = Z[:, :3, :, :]
             else:
-                raise RuntimeError(f"RGB guidance has {Z.shape[1]} channels; cannot adapt.")
+                # derive RGB proxy by selecting 3 bands from Y (after upsample) if possible
+                if Y.shape[1] >= 3:
+                    Z = Y[:, [0, Y.shape[1]//2, -1], :, :]
+                else:
+                    raise RuntimeError(f"RGB guidance has {Z.shape[1]} channels; cannot adapt.")
         HX = model(Y, Z)
         loss = criterion(HX, X).mean()
         epoch_loss += loss.item()
@@ -226,12 +235,19 @@ def test():
             if Y.shape[1] != opt.ChDim and Z.shape[1] == opt.ChDim:
                 Y, Z = Z, Y
             if Y.shape[1] != opt.ChDim:
-                raise RuntimeError(f"[Eval] HSI channel mismatch {Y.shape[1]} vs {opt.ChDim}")
+                if opt.reconstruct_lr and X.shape[1] == opt.ChDim:
+                    scale = opt.upscale_factor
+                    Y = torch.nn.functional.interpolate(X, scale_factor=1.0/scale, mode='bicubic', align_corners=False)
+                else:
+                    raise RuntimeError(f"[Eval] HSI channel mismatch {Y.shape[1]} vs {opt.ChDim}")
             if Z.shape[1] != 3:
                 if Z.shape[1] > 3:
                     Z = Z[:, :3, :, :]
                 else:
-                    raise RuntimeError(f"[Eval] RGB guidance has {Z.shape[1]} channels")
+                    if Y.shape[1] >= 3:
+                        Z = Y[:, [0, Y.shape[1]//2, -1], :, :]
+                    else:
+                        raise RuntimeError(f"[Eval] RGB guidance has {Z.shape[1]} channels")
             HX = model(Y, Z)
             end_time = time.time()
             X_np = torch.squeeze(X).permute(1, 2, 0).cpu().numpy()
@@ -270,10 +286,16 @@ if opt.mode == 1:
     for epoch in range(start_epoch, end_epoch + 1):
         avg_loss = train(epoch, optimizer, scheduler)
         checkpoint(epoch)
-        avg_psnr = test()
+        run_eval = (epoch % opt.eval_interval == 0) or (epoch == end_epoch)
+        if run_eval:
+            try:
+                avg_psnr = test()
+                if local_rank == 0:
+                    tb_logger.add_scalar('psnr', avg_psnr, epoch)
+            except RuntimeError as e:
+                if local_rank == 0:
+                    print(f"[Warn] Evaluation skipped due to error: {e}")
         torch.cuda.empty_cache()
-        if local_rank == 0:
-            tb_logger.add_scalar('psnr', avg_psnr, epoch)
         scheduler.step()
 
 else:
