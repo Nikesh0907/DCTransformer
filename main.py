@@ -19,6 +19,7 @@ from torch.autograd import Variable
 from psnr import MPSNR
 from datetime import datetime
 from torch.utils.tensorboard import SummaryWriter
+from torch.cuda.amp import autocast, GradScaler
 import torch.multiprocessing as mp
 import torch.distributed as dist
 import torch.distributed.autograd as dist_autograd
@@ -59,6 +60,7 @@ parser.add_argument('--no_progress', action='store_true', help='Disable tqdm pro
 parser.add_argument('--loss_smooth', type=int, default=50, help='Window for smoothed loss display in progress bar')
 parser.add_argument('--eval_interval', type=int, default=1, help='Run evaluation every N epochs (set >1 to reduce frequency).')
 parser.add_argument('--reconstruct_lr', action='store_true', help='Reconstruct low-res HSI on-the-fly from HR if channel mismatch occurs.')
+parser.add_argument('--amp', action='store_true', help='Enable mixed precision (AMP) for faster and more memory-efficient training.')
 opt = parser.parse_args()
 
 print(opt)
@@ -111,6 +113,8 @@ if use_dist:
 print('# network parameters: {}'.format(sum(param.numel() for param in model.parameters())))
 optimizer = optim.Adam(model.parameters(), lr=opt.lr)
 scheduler = MultiStepLR(optimizer, milestones=[100, 150, 175, 190, 195], gamma=0.5)
+use_amp = bool(opt.amp and device.type == 'cuda')
+scaler = GradScaler(enabled=use_amp)
 
 if local_rank == 0:
     print(f"[Dataset] Training base images: {getattr(train_set,'base_count', 'NA')}  | Virtual length: {len(train_set)}  | BatchSize: {opt.batchSize}  | Iter/Epoch: {len(training_data_loader)}")
@@ -194,14 +198,24 @@ def train(epoch, optimizer, scheduler):
                     Z = Y[:, [0, Y.shape[1]//2, -1], :, :]
                 else:
                     raise RuntimeError(f"RGB guidance has {Z.shape[1]} channels; cannot adapt.")
-        HX = model(Y, Z)
-        loss = criterion(HX, X).mean()
+        if use_amp:
+            with autocast():
+                HX = model(Y, Z)
+                loss = criterion(HX, X).mean()
+        else:
+            HX = model(Y, Z)
+            loss = criterion(HX, X).mean()
         epoch_loss += loss.item()
         if local_rank == 0:
             tb_logger.add_scalar('total_loss', loss.item(), current_step)
         current_step += 1
-        loss.backward()
-        optimizer.step()
+        if use_amp:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
         if use_bar:
             recent_losses.append(loss.item())
             if len(recent_losses) > opt.loss_smooth:
@@ -251,7 +265,11 @@ def test():
                             Z = Y[:, [0, Y.shape[1]//2, -1], :, :]
                         else:
                             raise ValueError(f"RGB guidance channels {Z.shape[1]}")
-                HX = model(Y, Z)
+                if use_amp:
+                    with autocast():
+                        HX = model(Y, Z)
+                else:
+                    HX = model(Y, Z)
                 end_time = time.time()
                 X_np = torch.squeeze(X).permute(1, 2, 0).cpu().numpy()
                 HX_np = torch.squeeze(HX).permute(1, 2, 0).cpu().numpy()
